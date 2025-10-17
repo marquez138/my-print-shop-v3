@@ -3,7 +3,7 @@ export const runtime = 'nodejs'
 import { NextResponse } from 'next/server'
 import { auth } from '@clerk/nextjs/server'
 import { prisma } from '@/lib/db'
-import { notifyUserApproved } from '@/lib/notify'
+import { notifyUserDecision } from '@/lib/notify'
 
 type Ctx = { params: Promise<{ id: string }> }
 
@@ -11,25 +11,32 @@ function json(message: string, status = 400) {
   return NextResponse.json({ error: message }, { status })
 }
 
-async function assertAdmin(userId?: string | null) {
-  if (!userId) return false
-  const me = await prisma.user.findFirst({
-    where: { clerkUserId: userId },
-    select: { role: true },
-  })
-  return me?.role === 'ADMIN'
-}
-
-export async function POST(_req: Request, ctx: Ctx) {
+export async function POST(req: Request, ctx: Ctx) {
   const { userId } = await auth()
-  if (!(await assertAdmin(userId))) return json('Forbidden', 403)
+  if (!userId) return json('Unauthorized', 401)
 
-  const { id } = await ctx.params
+  const { id: designId } = await ctx.params
 
-  // Must be submitted to approve
+  // Ensure caller is an admin
+  const admin = await prisma.user.findFirst({
+    where: { clerkUserId: userId, role: 'ADMIN' },
+    select: { id: true, email: true },
+  })
+  if (!admin) return json('Forbidden', 403)
+
+  // Optional body with comment
+  let adminComment: string | undefined
+  try {
+    const body = (await req.json()) as { comment?: string } | null
+    adminComment = body?.comment?.trim() || undefined
+  } catch {
+    // no body provided is fine
+  }
+
+  // Load design & owner
   const design = await prisma.design.findUnique({
-    where: { id },
-    include: { user: { select: { email: true } } },
+    where: { id: designId },
+    include: { user: { select: { id: true, email: true } } },
   })
   if (!design) return json('Design not found', 404)
   if (design.status !== 'submitted') {
@@ -39,22 +46,32 @@ export async function POST(_req: Request, ctx: Ctx) {
     )
   }
 
-  const updated = await prisma.design.update({
-    where: { id },
+  // Update status
+  await prisma.design.update({
+    where: { id: designId },
     data: { status: 'approved' },
-    include: {
-      placements: true,
-      comments: { orderBy: { createdAt: 'asc' } },
-      lineItems: true,
-      user: { select: { email: true } },
-    },
   })
 
-  if (updated.user?.email) {
-    notifyUserApproved(updated.user.email, updated.id).catch((err) =>
-      console.error('[notifyUserApproved] error:', err)
-    )
+  // Persist optional admin comment (use nested connect to satisfy Prisma types)
+  if (adminComment) {
+    await prisma.designComment.create({
+      data: {
+        body: adminComment,
+        design: { connect: { id: designId } },
+        author: { connect: { id: admin.id } },
+      },
+    })
   }
 
-  return NextResponse.json({ ok: true, design: updated })
+  // Notify user
+  if (design.user?.email) {
+    await notifyUserDecision({
+      to: design.user.email,
+      designId,
+      decision: 'approved',
+      comment: adminComment ?? null,
+    })
+  }
+
+  return NextResponse.json({ ok: true })
 }

@@ -3,7 +3,7 @@ export const runtime = 'nodejs'
 import { NextResponse } from 'next/server'
 import { auth } from '@clerk/nextjs/server'
 import { prisma } from '@/lib/db'
-import { notifyUserRejected } from '@/lib/notify'
+import { notifyUserDecision } from '@/lib/notify'
 
 type Ctx = { params: Promise<{ id: string }> }
 
@@ -11,35 +11,32 @@ function json(message: string, status = 400) {
   return NextResponse.json({ error: message }, { status })
 }
 
-async function assertAdmin(userId?: string | null) {
-  if (!userId) return false
-  const me = await prisma.user.findFirst({
-    where: { clerkUserId: userId },
-    select: { role: true, id: true },
-  })
-  return me?.role === 'ADMIN' ? me : null
-}
-
 export async function POST(req: Request, ctx: Ctx) {
   const { userId } = await auth()
-  const admin = await assertAdmin(userId)
+  if (!userId) return json('Unauthorized', 401)
+
+  const { id: designId } = await ctx.params
+
+  // Ensure caller is an admin
+  const admin = await prisma.user.findFirst({
+    where: { clerkUserId: userId, role: 'ADMIN' },
+    select: { id: true, email: true },
+  })
   if (!admin) return json('Forbidden', 403)
 
-  const { id } = await ctx.params
-
-  // Optional reason/comment from admin
-  let body: { reason?: string } | null = null
+  // Optional body with comment
+  let adminComment: string | undefined
   try {
-    body = (await req.json()) as { reason?: string }
+    const body = (await req.json()) as { comment?: string } | null
+    adminComment = body?.comment?.trim() || undefined
   } catch {
-    // ignore empty body
+    // no body provided is fine
   }
-  const reason = body?.reason?.trim()
 
-  // Must be submitted to reject (you can allow draft → rejected if desired)
+  // Load design & owner
   const design = await prisma.design.findUnique({
-    where: { id },
-    include: { user: { select: { email: true } } },
+    where: { id: designId },
+    include: { user: { select: { id: true, email: true } } },
   })
   if (!design) return json('Design not found', 404)
   if (design.status !== 'submitted') {
@@ -49,37 +46,32 @@ export async function POST(req: Request, ctx: Ctx) {
     )
   }
 
-  const updated = await prisma.$transaction(async (tx) => {
-    const d = await tx.design.update({
-      where: { id },
-      data: { status: 'rejected' },
-      include: {
-        user: { select: { email: true } },
-        placements: true,
-        comments: { orderBy: { createdAt: 'asc' } },
-        lineItems: true,
-      },
-    })
-
-    // Persist admin comment if provided (optional, but useful)
-    if (reason) {
-      await tx.designComment.create({
-        data: {
-          designId: id,
-          authorId: admin.id, // admin's User.id
-          body: reason,
-        },
-      })
-    }
-
-    return d
+  // Update status
+  await prisma.design.update({
+    where: { id: designId },
+    data: { status: 'rejected' },
   })
 
-  if (updated.user?.email) {
-    notifyUserRejected(updated.user.email, reason).catch((err) =>
-      console.error('[notifyUserRejected] error:', err)
-    )
+  // Persist optional admin comment
+  if (adminComment) {
+    await prisma.designComment.create({
+      data: {
+        body: adminComment,
+        design: { connect: { id: designId } },
+        author: { connect: { id: admin.id } },
+      },
+    })
   }
 
-  return NextResponse.json({ ok: true, design: updated })
+  // Notify user
+  if (design.user?.email) {
+    await notifyUserDecision({
+      to: design.user.email,
+      designId,
+      decision: 'rejected',
+      comment: adminComment ?? null,
+    })
+  }
+
+  return NextResponse.json({ ok: true })
 }
